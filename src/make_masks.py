@@ -1,25 +1,29 @@
 import argparse
-import os
-import cv2
-import torch
-import torchvision.transforms as transforms
-import numpy as np
-from PIL import Image
-import glob
-from tqdm import tqdm
-import sys
 import csv
+import glob
+import os
+import sys
+from collections import deque
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+import torchvision.models as models
+import torchvision.transforms as transforms
+from PIL import Image
+from tqdm import tqdm
+
+CURRENT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = CURRENT_DIR.parent
 SRC_DIR = PROJECT_ROOT / "src"
 for p in {PROJECT_ROOT, SRC_DIR}:
     if str(p) not in sys.path:
         sys.path.append(str(p))
 
 from colab_model import UNet  # 기존 lane_model 대체
-import torchvision.models as models
-import torch.nn as nn
+from find_diff import DepartureRatioSample, DepartureWindowStats, summarize_departure_samples
 
 
 class ResNetSegmentation(nn.Module):
@@ -73,7 +77,14 @@ class ResNetSegmentation(nn.Module):
 
 
 class LaneDepartureAnalyzer:
-    def __init__(self, model_path, device='auto', threshold=0.5, use_resnet=False):
+    def __init__(
+        self,
+        model_path,
+        device='auto',
+        threshold=0.5,
+        use_resnet=False,
+        vehicle_center_x: float | None = 620.0,
+    ):
         """
         Args:
             model_path: 모델 파일 경로
@@ -179,6 +190,7 @@ class LaneDepartureAnalyzer:
         ])
         
         self.threshold = threshold
+        self.vehicle_center_x = vehicle_center_x
         
         print(f"모델 로드 완료: {model_path}")
         print(f"디바이스: {self.device}")
@@ -214,6 +226,84 @@ class LaneDepartureAnalyzer:
         mask = (prediction > threshold).astype(np.uint8) * 255
         
         return mask
+    
+    def postprocess_mask(self, mask: np.ndarray, bottom_ratio: float = 0.0,
+                         roi_mask: np.ndarray | None = None) -> np.ndarray:
+        """예측된 마스크에 하단 제거 및 ROI 마스크를 적용한다."""
+        processed = mask
+        if bottom_ratio > 0:
+            processed = self.remove_bottom_region(processed, bottom_ratio=bottom_ratio)
+        if roi_mask is not None:
+            processed = apply_roi_mask(processed, roi_mask)
+        return processed
+    
+    def analyze_rgb(self, image_rgb: np.ndarray, depart_thr: float = None,
+                    bottom_ratio: float = 0.0,
+                    roi_mask: np.ndarray | None = None) -> dict:
+        """RGB 이미지 배열 기반 차선 분석."""
+        if depart_thr is None:
+            depart_thr = self.threshold
+        mask = self.predict_mask(image_rgb)
+        processed_mask = self.postprocess_mask(mask, bottom_ratio=bottom_ratio, roi_mask=roi_mask)
+        return self._collect_metrics(image_rgb, processed_mask, depart_thr)
+    
+    def _collect_metrics(self, image_rgb: np.ndarray, mask: np.ndarray,
+                         depart_thr: float) -> dict:
+        h, w = image_rgb.shape[:2]
+        lane_center_x, lane_width, left_x, right_x, both_sides = self.compute_lane_center_and_width(mask)
+        
+        if self.vehicle_center_x is None:
+            vehicle_center_x = w / 2.0
+        else:
+            vehicle_center_x = float(np.clip(self.vehicle_center_x, 0.0, w - 1))
+        vehicle_center_x = float(vehicle_center_x)
+        
+        norm_offset = None
+        departed = False
+        left_departed = False
+        right_departed = False
+        left_ratio = 0.0
+        right_ratio = 0.0
+        offset_px = None
+        
+        if lane_center_x is not None:
+            offset_px = lane_center_x - vehicle_center_x
+            if lane_width is None:
+                denom = max(1.0, (w / 2.0))
+            else:
+                denom = max(1.0, lane_width / 2.0)
+            norm_offset = float(abs(offset_px) / denom)
+            departed = norm_offset > depart_thr
+            ratio_pct = norm_offset * 100.0
+            if offset_px < 0:
+                left_ratio = ratio_pct
+            elif offset_px > 0:
+                right_ratio = ratio_pct
+        
+        if left_x is not None:
+            left_departed = vehicle_center_x < left_x
+        if right_x is not None:
+            right_departed = vehicle_center_x > right_x
+        
+        return {
+            'image_rgb': image_rgb,
+            'mask': mask,
+            'width': w,
+            'height': h,
+            'lane_center_x': lane_center_x,
+            'lane_width': lane_width,
+            'left_x': left_x,
+            'right_x': right_x,
+            'norm_offset': norm_offset,
+            'departed': departed,
+            'left_departed': left_departed,
+            'right_departed': right_departed,
+            'both_sides_detected': both_sides,
+            'left_ratio': left_ratio,
+            'right_ratio': right_ratio,
+            'vehicle_center_x': vehicle_center_x,
+            'offset_px': offset_px,
+        }
     
     def remove_bottom_region(self, mask, bottom_ratio=0.3):
         """
@@ -293,7 +383,8 @@ class LaneDepartureAnalyzer:
         
         return None, None, None, None, False
     
-    def analyze_image(self, image_path, depart_thr=0.5):
+    def analyze_image(self, image_path, depart_thr=0.5, bottom_ratio=0.3,
+                      roi_mask: np.ndarray | None = None):
         """
         단일 이미지 분석
         
@@ -305,70 +396,34 @@ class LaneDepartureAnalyzer:
             dict: 분석 결과
         """
         # 이미지 로드
-        img_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        image_path = Path(image_path)
+        image_path_str = str(image_path)
+        img_bgr = cv2.imread(image_path_str, cv2.IMREAD_COLOR)
         if img_bgr is None:
             raise FileNotFoundError(f"이미지를 읽을 수 없습니다: {image_path}")
         
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         h, w = img_rgb.shape[:2]
         
-        # 차선 마스크 예측
-        mask = self.predict_mask(img_rgb)
-        
-        # 아래 30% 영역 제거
-        mask_cleaned = self.remove_bottom_region(mask, bottom_ratio=0.3)
-        
-        # 차선 중심과 폭 계산
-        lane_center_x, lane_width, left_x, right_x, both_sides = self.compute_lane_center_and_width(mask_cleaned)
-        
-        # 차량 중심 (화면 중앙)
-        vehicle_center_x = w / 2.0
-        
-        # 정규화된 오프셋 계산
-        norm_offset = None
-        departed = False
-        left_departed = False
-        right_departed = False
-        
-        if lane_center_x is not None:
-            offset_px = lane_center_x - vehicle_center_x
-            if lane_width is None:
-                # 차선 폭을 알 수 없으면 화면 절반 폭을 기준으로 정규화
-                denom = max(1.0, (w / 2.0))
-            else:
-                denom = max(1.0, (lane_width / 2.0))
-            norm_offset = float(abs(offset_px) / denom)
-            departed = norm_offset > depart_thr
-            
-            # 왼쪽/오른쪽 차선 이탈 판단
-            if left_x is not None:
-                # 차량 중심이 왼쪽 차선보다 왼쪽에 있으면 왼쪽 이탈
-                left_departed = vehicle_center_x < left_x
-            if right_x is not None:
-                # 차량 중심이 오른쪽 차선보다 오른쪽에 있으면 오른쪽 이탈
-                right_departed = vehicle_center_x > right_x
-        
-        return {
-            'image_path': image_path,
-            'image_name': os.path.basename(image_path),
-            'width': w,
-            'height': h,
-            'lane_center_x': lane_center_x,
-            'lane_width': lane_width,
-            'left_x': left_x,
-            'right_x': right_x,
-            'norm_offset': norm_offset,
-            'departed': departed,
-            'left_departed': left_departed,
-            'right_departed': right_departed,
-            'both_sides_detected': both_sides,
-            'mask': mask_cleaned,
-            'image_rgb': img_rgb,
-        }
+        result = self.analyze_rgb(
+            img_rgb,
+            depart_thr=depart_thr,
+            bottom_ratio=bottom_ratio,
+            roi_mask=roi_mask,
+        )
+        result.update({
+            'image_path': image_path_str,
+            'image_name': image_path.name,
+        })
+        return result
     
     def draw_overlay(self, image_rgb, mask, lane_center_x, lane_width, left_x, right_x, 
                      norm_offset, departed, left_departed, right_departed,
-                     left_departure_rate=None, right_departure_rate=None, total_departure_rate=None):
+                     left_departure_rate=None, right_departure_rate=None, total_departure_rate=None,
+                     car_center_x: float | None = None,
+                     per_frame_left_ratio: float | None = None,
+                     per_frame_right_ratio: float | None = None,
+                     window_stats: DepartureWindowStats | None = None):
         """
         오버레이 이미지 생성 (차선 표시 및 통계 정보)
         
@@ -401,11 +456,22 @@ class LaneDepartureAnalyzer:
         color_mask[mask > 0] = [0, 0, 255]  # BGR에서 빨간색
         overlay = cv2.addWeighted(overlay, 0.65, color_mask, 0.35, 0)  # 차선을 더 명확하게 표시
         
-        # 차량 중심선 (노란색) - 화면 중앙 (BGR 순서: 0, 255, 255)
-        cx_vehicle = w // 2
+        # 차량 중심선 (노란색) - 사용자가 지정한 x좌표
+        if car_center_x is None:
+            cx_vehicle = w // 2
+        else:
+            cx_vehicle = int(np.clip(round(car_center_x), 0, w - 1))
         cv2.line(overlay, (cx_vehicle, int(h * 0.6)), (cx_vehicle, h - 1), (0, 255, 255), 3)
-        cv2.putText(overlay, "Vehicle Center", (cx_vehicle - 80, int(h * 0.58)), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(
+            overlay,
+            f"Vehicle Center ({cx_vehicle})",
+            (max(0, cx_vehicle - 110), int(h * 0.58)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
         
         # 차선 중심선 (초록색) (BGR 순서: 0, 255, 0)
         if lane_center_x is not None:
@@ -431,19 +497,33 @@ class LaneDepartureAnalyzer:
                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1, cv2.LINE_AA)
         
         # 정보 패널 (오른쪽 상단)
-        info_lines = []
+        info_lines: list[str] = []
+
+        def add_blank():
+            if info_lines and info_lines[-1] != "":
+                info_lines.append("")
         
-        # 전체 통계 정보를 먼저 표시 (이탈률)
+        summary_lines = []
         if total_departure_rate is not None:
-            info_lines.append(f"Total: {total_departure_rate:.1f}%")
+            summary_lines.append(f"Total: {total_departure_rate:.1f}%")
         if left_departure_rate is not None:
-            info_lines.append(f"Left: {left_departure_rate:.1f}%")
+            summary_lines.append(f"Left: {left_departure_rate:.1f}%")
         if right_departure_rate is not None:
-            info_lines.append(f"Right: {right_departure_rate:.1f}%")
-        
-        # 구분선 추가
-        if info_lines:
-            info_lines.append("")
+            summary_lines.append(f"Right: {right_departure_rate:.1f}%")
+        if summary_lines:
+            info_lines.extend(summary_lines)
+            add_blank()
+
+        if window_stats and window_stats.sample_count > 0:
+            info_lines.append(f"Window: {window_stats.sample_count}f")
+            info_lines.append(
+                f" Avg L: {window_stats.avg_left_ratio:.1f}% | Avg R: {window_stats.avg_right_ratio:.1f}%"
+            )
+            depart_line = f" Depart: {window_stats.departure_rate:.1f}%"
+            if window_stats.dominant_side:
+                depart_line += f" ({window_stats.dominant_side})"
+            info_lines.append(depart_line)
+            add_blank()
         
         # 이탈 상태 표시
         status_parts = []
@@ -465,6 +545,11 @@ class LaneDepartureAnalyzer:
             info_lines.append(f"Offset: {norm_offset:.3f}")
         if lane_width is not None:
             info_lines.append(f"Width: {lane_width:.0f}px")
+        
+        if per_frame_left_ratio is not None or per_frame_right_ratio is not None:
+            add_blank()
+            info_lines.append(f"Frame L: {0.0 if per_frame_left_ratio is None else per_frame_left_ratio:.1f}%")
+            info_lines.append(f"Frame R: {0.0 if per_frame_right_ratio is None else per_frame_right_ratio:.1f}%")
         
         # 배경 박스 (오른쪽 상단)
         text_height = 22
@@ -536,6 +621,21 @@ def load_roi_mask(mask_path: Path | None,
     return roi_arr
 
 
+def apply_roi_mask(mask: np.ndarray, roi_mask: np.ndarray | None) -> np.ndarray:
+    """ROI 마스크를 차선 마스크에 적용."""
+    if roi_mask is None:
+        return mask
+    if roi_mask.shape != mask.shape:
+        resized_roi = cv2.resize(
+            roi_mask,
+            (mask.shape[1], mask.shape[0]),
+            interpolation=cv2.INTER_NEAREST,
+        )
+    else:
+        resized_roi = roi_mask
+    return cv2.bitwise_and(mask, mask, mask=resized_roi)
+
+
 def collect_image_files(image_dir: Path, limit: int | None = None) -> list[Path]:
     if not image_dir.exists():
         raise FileNotFoundError(f"이미지 디렉터리가 없습니다: {image_dir}")
@@ -550,23 +650,15 @@ def collect_image_files(image_dir: Path, limit: int | None = None) -> list[Path]
     return paths
 
 
-def generate_masks_from_dataset(args) -> None:
+def generate_masks_from_dataset(args, analyzer: LaneDepartureAnalyzer,
+                                roi_mask: np.ndarray | None) -> None:
     image_dir: Path = args.image_dir.resolve()
     mask_dir: Path = args.mask_dir.resolve()
     answer_dir: Path = args.answer_dir.resolve()
-    model_path: Path = args.model_path.resolve()
-    roi_mask = load_roi_mask(args.roi_mask, None) if args.roi_mask else None
 
     mask_dir.mkdir(parents=True, exist_ok=True)
     if args.copy_to_answer:
         answer_dir.mkdir(parents=True, exist_ok=True)
-
-    analyzer = LaneDepartureAnalyzer(
-        model_path=str(model_path),
-        device=args.device,
-        threshold=args.threshold,
-        use_resnet=args.use_resnet,
-    )
 
     image_paths = collect_image_files(image_dir, args.limit)
     print(f"[INFO] 총 {len(image_paths)}장의 이미지를 처리합니다.")
@@ -578,18 +670,11 @@ def generate_masks_from_dataset(args) -> None:
             continue
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         mask = analyzer.predict_mask(img_rgb)
-        if args.bottom_ratio > 0:
-            mask = analyzer.remove_bottom_region(mask, bottom_ratio=args.bottom_ratio)
-        if roi_mask is not None:
-            if roi_mask.shape != mask.shape:
-                resized_roi = cv2.resize(
-                    roi_mask,
-                    (mask.shape[1], mask.shape[0]),
-                    interpolation=cv2.INTER_NEAREST,
-                )
-            else:
-                resized_roi = roi_mask
-            mask = cv2.bitwise_and(mask, mask, mask=resized_roi)
+        mask = analyzer.postprocess_mask(
+            mask,
+            bottom_ratio=args.bottom_ratio,
+            roi_mask=roi_mask,
+        )
 
         mask_filename = f"{img_path.stem}_mask.png"
         mask_output = mask_dir / mask_filename
@@ -602,6 +687,103 @@ def generate_masks_from_dataset(args) -> None:
               f"{mask_filename} (coverage {coverage:.4f})")
 
     print("[INFO] 마스크 생성을 마쳤습니다.")
+
+
+def generate_overlay_video(args, analyzer: LaneDepartureAnalyzer,
+                           roi_mask: np.ndarray | None) -> Path:
+    video_path: Path = args.video_path.resolve()
+    if not video_path.exists():
+        raise FileNotFoundError(f"영상 파일을 찾을 수 없습니다: {video_path}")
+
+    if args.video_output is None:
+        output_path = PROJECT_ROOT / "outputs" / f"{video_path.stem}_overlay.mp4"
+    else:
+        output_path = args.video_output.resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"영상을 열 수 없습니다: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not fps or fps <= 1e-3:
+        fps = args.video_fps or 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if width <= 0 or height <= 0:
+        raise RuntimeError("영상 해상도를 확인할 수 없습니다.")
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+    if not writer.isOpened():
+        cap.release()
+        raise RuntimeError(f"출력 영상을 생성할 수 없습니다: {output_path}")
+
+    window_size = max(1, int(round(fps * args.video_window_sec)))
+    ratio_window: deque[DepartureRatioSample] = deque(maxlen=window_size)
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_limit = args.video_max_frames if args.video_max_frames else None
+    progress_total = frame_limit or (total_frames if total_frames > 0 else None)
+    processed = 0
+
+    progress = tqdm(total=progress_total, desc="영상 처리", unit="frame")
+    try:
+        while True:
+            ret, frame_bgr = cap.read()
+            if not ret:
+                break
+
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            frame_result = analyzer.analyze_rgb(
+                frame_rgb,
+                depart_thr=args.threshold,
+                bottom_ratio=args.bottom_ratio,
+                roi_mask=roi_mask,
+            )
+
+            ratio_window.append(
+                DepartureRatioSample(
+                    left_ratio=frame_result['left_ratio'],
+                    right_ratio=frame_result['right_ratio'],
+                    departed=frame_result['departed'],
+                )
+            )
+            window_stats = summarize_departure_samples(ratio_window)
+
+            overlay_rgb = analyzer.draw_overlay(
+                image_rgb=frame_result['image_rgb'],
+                mask=frame_result['mask'],
+                lane_center_x=frame_result['lane_center_x'],
+                lane_width=frame_result['lane_width'],
+                left_x=frame_result['left_x'],
+                right_x=frame_result['right_x'],
+                norm_offset=frame_result['norm_offset'],
+                departed=frame_result['departed'],
+                left_departed=frame_result['left_departed'],
+                right_departed=frame_result['right_departed'],
+                left_departure_rate=None,
+                right_departure_rate=None,
+                total_departure_rate=None,
+                car_center_x=frame_result['vehicle_center_x'],
+                per_frame_left_ratio=frame_result['left_ratio'],
+                per_frame_right_ratio=frame_result['right_ratio'],
+                window_stats=window_stats,
+            )
+
+            writer.write(cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR))
+
+            processed += 1
+            progress.update(1)
+            if frame_limit and processed >= frame_limit:
+                break
+    finally:
+        progress.close()
+        cap.release()
+        writer.release()
+
+    print(f"[INFO] 영상 처리 완료 ({processed} frames) → {output_path}")
+    return output_path
 
 
 def parse_mask_cli_args() -> argparse.Namespace:
@@ -623,14 +805,46 @@ def parse_mask_cli_args() -> argparse.Namespace:
                         help="생성된 마스크를 answer 디렉터리에도 복사")
     parser.add_argument("--use-resnet", action="store_true",
                         help="Wide ResNet 세그멘테이션 모델 로드 시도")
+    parser.add_argument("--car-center-x", type=float, default=620.0,
+                        help="오버레이에 사용할 차량 중심 X 좌표")
+    parser.add_argument("--video-path", type=Path, default=None,
+                        help="차선 이탈률 오버레이를 생성할 입력 영상 경로")
+    parser.add_argument("--video-output", type=Path, default=None,
+                        help="오버레이 결과 영상을 저장할 경로 (기본: outputs/<이름>_overlay.mp4)")
+    parser.add_argument("--video-window-sec", type=float, default=2.0,
+                        help="실시간 시나리오를 위한 차선 이탈률 윈도 길이(초)")
+    parser.add_argument("--video-max-frames", type=int, default=None,
+                        help="디버깅용: 처리할 최대 프레임 수")
+    parser.add_argument("--video-fps", type=float, default=None,
+                        help="영상 메타데이터에 FPS가 없을 경우 사용할 값")
+    parser.add_argument("--video-only", action="store_true",
+                        help="마스크 생성은 건너뛰고 영상 오버레이만 생성")
     return parser.parse_args()
 
 
 def mask_generation_cli():
     args = parse_mask_cli_args()
-    if args.disable_roi:
-        args.roi_mask = None
-    generate_masks_from_dataset(args)
+    roi_mask = None
+    if not args.disable_roi and args.roi_mask is not None:
+        roi_mask = load_roi_mask(args.roi_mask, None)
+
+    analyzer = LaneDepartureAnalyzer(
+        model_path=str(args.model_path.resolve()),
+        device=args.device,
+        threshold=args.threshold,
+        use_resnet=args.use_resnet,
+        vehicle_center_x=args.car_center_x,
+    )
+
+    if not args.video_only:
+        generate_masks_from_dataset(args, analyzer, roi_mask)
+    if args.video_path:
+        args.video_path = args.video_path.expanduser().resolve()
+        if args.video_output:
+            args.video_output = args.video_output.expanduser()
+        generate_overlay_video(args, analyzer, roi_mask)
+    elif args.video_only:
+        print("[WARN] --video-only 옵션이 지정되었지만 --video-path 가 없어 실행할 작업이 없습니다.")
 
 
 def lane_departure_analysis_report():
