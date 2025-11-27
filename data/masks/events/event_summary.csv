@@ -1,0 +1,10 @@
+event_id,frames,avg_coverage,departed_rate,left_departed_rate,right_departed_rate,avg_left_ratio,avg_right_ratio,mask_dir
+이벤트 1,38,0.0046,0.0,0.0,0.0,0.0,2.22,data/masks/events/이벤트 1
+이벤트 10,45,0.0036,22.22,0.0,0.0,0.0,13.66,data/masks/events/이벤트 10
+이벤트 11,44,0.0035,40.91,0.0,0.0,0.0,36.81,data/masks/events/이벤트 11
+이벤트 4,36,0.009,0.0,0.0,0.0,0.0,0.0,data/masks/events/이벤트 4
+이벤트 5,36,0.0049,80.56,0.0,0.0,0.51,63.49,data/masks/events/이벤트 5
+이벤트 6,32,0.006,9.38,0.0,0.0,0.0,8.65,data/masks/events/이벤트 6
+이벤트 7,56,0.0067,1.79,0.0,0.0,0.0,0.92,data/masks/events/이벤트 7
+이벤트 8,23,0.0025,0.0,0.0,0.0,0.0,17.73,data/masks/events/이벤트 8
+이벤트 9,26,0.0032,0.0,0.0,0.0,0.0,0.0,data/masks/events/이벤트 9

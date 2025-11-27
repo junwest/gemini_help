@@ -1,0 +1,101 @@
+[
+  {
+    "event_id": "이벤트 1",
+    "frames": 38,
+    "avg_coverage": 0.0046,
+    "departed_rate": 0.0,
+    "left_departed_rate": 0.0,
+    "right_departed_rate": 0.0,
+    "avg_left_ratio": 0.0,
+    "avg_right_ratio": 2.22,
+    "mask_dir": "data/masks/events/이벤트 1"
+  },
+  {
+    "event_id": "이벤트 10",
+    "frames": 45,
+    "avg_coverage": 0.0036,
+    "departed_rate": 22.22,
+    "left_departed_rate": 0.0,
+    "right_departed_rate": 0.0,
+    "avg_left_ratio": 0.0,
+    "avg_right_ratio": 13.66,
+    "mask_dir": "data/masks/events/이벤트 10"
+  },
+  {
+    "event_id": "이벤트 11",
+    "frames": 44,
+    "avg_coverage": 0.0035,
+    "departed_rate": 40.91,
+    "left_departed_rate": 0.0,
+    "right_departed_rate": 0.0,
+    "avg_left_ratio": 0.0,
+    "avg_right_ratio": 36.81,
+    "mask_dir": "data/masks/events/이벤트 11"
+  },
+  {
+    "event_id": "이벤트 4",
+    "frames": 36,
+    "avg_coverage": 0.009,
+    "departed_rate": 0.0,
+    "left_departed_rate": 0.0,
+    "right_departed_rate": 0.0,
+    "avg_left_ratio": 0.0,
+    "avg_right_ratio": 0.0,
+    "mask_dir": "data/masks/events/이벤트 4"
+  },
+  {
+    "event_id": "이벤트 5",
+    "frames": 36,
+    "avg_coverage": 0.0049,
+    "departed_rate": 80.56,
+    "left_departed_rate": 0.0,
+    "right_departed_rate": 0.0,
+    "avg_left_ratio": 0.51,
+    "avg_right_ratio": 63.49,
+    "mask_dir": "data/masks/events/이벤트 5"
+  },
+  {
+    "event_id": "이벤트 6",
+    "frames": 32,
+    "avg_coverage": 0.006,
+    "departed_rate": 9.38,
+    "left_departed_rate": 0.0,
+    "right_departed_rate": 0.0,
+    "avg_left_ratio": 0.0,
+    "avg_right_ratio": 8.65,
+    "mask_dir": "data/masks/events/이벤트 6"
+  },
+  {
+    "event_id": "이벤트 7",
+    "frames": 56,
+    "avg_coverage": 0.0067,
+    "departed_rate": 1.79,
+    "left_departed_rate": 0.0,
+    "right_departed_rate": 0.0,
+    "avg_left_ratio": 0.0,
+    "avg_right_ratio": 0.92,
+    "mask_dir": "data/masks/events/이벤트 7"
+  },
+  {
+    "event_id": "이벤트 8",
+    "frames": 23,
+    "avg_coverage": 0.0025,
+    "departed_rate": 0.0,
+    "left_departed_rate": 0.0,
+    "right_departed_rate": 0.0,
+    "avg_left_ratio": 0.0,
+    "avg_right_ratio": 17.73,
+    "mask_dir": "data/masks/events/이벤트 8"
+  },
+  {
+    "event_id": "이벤트 9",
+    "frames": 26,
+    "avg_coverage": 0.0032,
+    "departed_rate": 0.0,
+    "left_departed_rate": 0.0,
+    "right_departed_rate": 0.0,
+    "avg_left_ratio": 0.0,
+    "avg_right_ratio": 0.0,
+    "mask_dir": "data/masks/events/이벤트 9"
+  }
+]
